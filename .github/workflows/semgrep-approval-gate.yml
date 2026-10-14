@@ -1,8 +1,7 @@
-# Semgrep PR gate, step 1 of 2: scan and report.
+# Semgrep PR scan: scan and report.
 #
-# PR opened/updated -> Semgrep scans it -> findings are posted on the PR and
-# the check fails. Step 2 (semgrep-decision.yml) waits for a reviewer to
-# approve (PR is merged) or request changes (PR is closed).
+# PR opened/updated -> Semgrep scans it -> new findings are posted on the PR
+# as a comment and file annotations, and the check fails. Report only.
 #
 # Deliberately no LLM and no auto-fix: nothing here writes code or creates
 # branches. Runs on a self-hosted runner (label `sast-gate`) with python, git
@@ -73,5 +72,5 @@ jobs:
       - name: Fail the check when there are findings
         if: steps.report.outputs.findings != '0'
         run: |
-          echo "::error::Semgrep reported ${{ steps.report.outputs.findings }} finding(s). A reviewer must approve or request changes on the PR."
+          echo "::error::Semgrep reported ${{ steps.report.outputs.findings }} finding(s). See the PR comment."
           exit 1
