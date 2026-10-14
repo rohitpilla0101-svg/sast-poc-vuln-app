@@ -3,6 +3,10 @@
 Deliberately vulnerable Flask app used as a demo target for the
 sast-autofix-poc pipeline. Do not deploy this anywhere reachable.
 
+> **Client demo (Semgrep scan + manual approval, no LLM):** see
+> [DEMO-APPROVAL-GATE.md](DEMO-APPROVAL-GATE.md). The original LLM autofix PoC
+> is preserved at tag `poc-llm-autofix-v1` and in `poc-archive/llm-autofix/`.
+
 ## Bugs (for demo narration)
 
 1. `GET /search?username=...` — SQL injection (CWE-89), string-interpolated
