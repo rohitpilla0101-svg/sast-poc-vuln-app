@@ -4,10 +4,10 @@
 No LLM and no auto-fix: this only reports. Subcommands:
 
   report   read semgrep.json, write the job summary, emit file annotations,
-           upsert one sticky PR comment, and set the step outputs
-           `findings` and `approval_ready`.
-  decide   post the approve/reject outcome on the PR (uses the run's
-           approval history for the reviewer name).
+           upsert one sticky PR comment, and set the step output `findings`.
+  decide   act on a PR review (env: REVIEW_STATE, REVIEW_BODY, REVIEWER,
+           REVIEWER_ASSOCIATION, PR_NUMBER, PR_HEAD_SHA): approve merges the
+           PR, request changes closes it. Only when findings are pending.
 
 Dry run (no GitHub calls): python semgrep_gate.py report semgrep.json --dry-run
 """
@@ -21,6 +21,7 @@ MARKER = "<!-- semgrep-gate -->"
 SEVERITY_RANK = {"INFO": 0, "WARNING": 1, "ERROR": 2}
 SEVERITY_ICON = {"ERROR": "🔴", "WARNING": "🟠", "INFO": "🔵"}
 MAX_LISTED = 40  # keep the comment far below GitHub's 65,536 char limit
+PENDING_HEADING = "### ⏳ Waiting for a manual decision"  # `decide` looks for this
 
 
 def sh(args, check=True):
@@ -72,19 +73,7 @@ def source_snippet(path, start, end):
         return ""
 
 
-def approval_ready(repo, env_name):
-    """Fail closed: GitHub silently creates a missing environment with no
-    protection rules, which would let the approval job pass unattended."""
-    r = gh_api(f"repos/{repo}/environments/{env_name}", check=False)
-    if r.returncode != 0:
-        return False
-    rules = json.loads(r.stdout).get("protection_rules", [])
-    return any(
-        rule.get("type") == "required_reviewers" and rule.get("reviewers") for rule in rules
-    )
-
-
-def build_comment(findings, ctx, ready):
+def build_comment(findings, ctx):
     n = len(findings)
     sev_counts = {}
     for f in findings:
@@ -116,24 +105,15 @@ def build_comment(findings, ctx, ready):
             out += ["```", snippet, "```"]
         out.append("")
     out += ["</details>", ""]
-    if ready:
-        out += [
-            "### ⏳ Waiting for a manual decision",
-            "",
-            f"A designated reviewer must open the [workflow run]({ctx['run_url']}) → "
-            "**Review deployments** and choose:",
-            "- **Approve** — the PR is merged.",
-            "- **Reject** — the PR is closed without merging.",
-            "",
-            "_Nothing is auto-fixed and no new branch is created._",
-        ]
-    else:
-        out += [
-            "### ⛔ Blocked — approval environment is not configured",
-            "",
-            f"The `{ctx['env']}` environment needs required reviewers before this PR can be "
-            "decided. Run `scripts/setup-approval-environment.sh` (see DEMO-APPROVAL-GATE.md).",
-        ]
+    out += [
+        PENDING_HEADING,
+        "",
+        "A reviewer with write access must submit a review on this PR:",
+        "- **Approve** (or review comment `/approve`) — the PR is merged.",
+        "- **Request changes** (or review comment `/reject`) — the PR is closed without merging.",
+        "",
+        "_Nothing is auto-fixed and no new branch is created._",
+    ]
     return "\n".join(out)
 
 
@@ -157,30 +137,27 @@ def write_output(name, value):
 def cmd_report(args):
     repo = os.environ.get("GITHUB_REPOSITORY", "owner/repo")
     sha = os.environ.get("PR_HEAD_SHA", "0000000")
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     ctx = {
         "sha": sha,
-        "env": args.environment,
-        "run_url": f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}"
-        f"/actions/runs/{os.environ.get('GITHUB_RUN_ID', '0')}",
-        "blob": f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/blob/{sha}",
+        "run_url": f"{server}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '0')}",
+        "blob": f"{server}/{repo}/blob/{sha}",
     }
     findings = load_findings(args.input, args.min_severity)
     write_output("findings", len(findings))
+    pr = os.environ.get("PR_NUMBER")
+    post = not args.dry_run and pr and args.comment
     if not findings:
         print("No Semgrep findings at or above", args.min_severity)
-        write_output("approval_ready", "false")
-        if not args.dry_run and os.environ.get("PR_NUMBER") and args.comment:
+        if post:
             upsert_comment(
-                repo, os.environ["PR_NUMBER"],
+                repo, pr,
                 f"{MARKER}\n## ✅ Semgrep: no security issues found\n\nScanned `{sha[:7]}` · "
                 f"[workflow run]({ctx['run_url']})",
             )
         return 0
 
-    ready = True if args.dry_run else approval_ready(repo, args.environment)
-    body = build_comment(findings, ctx, ready)
-    write_output("approval_ready", "true" if ready else "false")
-
+    body = build_comment(findings, ctx)
     for f in findings:  # inline annotations on the PR's Files tab
         title = f"Semgrep {f['severity']}: {f['rule'].split('.')[-1]}"
         level = "error" if f["severity"] == "ERROR" else "warning"
@@ -192,32 +169,64 @@ def cmd_report(args):
             fh.write(body.replace(MARKER, "") + "\n")
     if args.dry_run:
         print(body)
-    elif os.environ.get("PR_NUMBER") and args.comment:
-        upsert_comment(repo, os.environ["PR_NUMBER"], body)
+    elif post:
+        upsert_comment(repo, pr, body)
     return 0
 
 
+def find_sticky(repo, pr):
+    r = gh_api(f"repos/{repo}/issues/{pr}/comments", "--paginate", "--jq",
+               f'.[] | select(.body | startswith("{MARKER}")) | {{id, body}}')
+    for line in r.stdout.splitlines():
+        return json.loads(line)
+    return None
+
+
 def cmd_decide(args):
-    repo, run_id, pr = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"], os.environ["PR_NUMBER"]
-    r = gh_api(f"repos/{repo}/actions/runs/{run_id}/approvals", check=False)
-    who, note = "a reviewer", ""
-    if r.returncode == 0:
-        history = json.loads(r.stdout)
-        if history:
-            last = history[-1]
-            who = f"@{last['user']['login']}"
-            note = f"\n\n> {last['comment']}" if last.get("comment") else ""
-    approved = args.outcome == "approved"
+    """Act on a PR review: approve -> merge, request changes -> close."""
+    env = os.environ
+    repo, pr = env["GITHUB_REPOSITORY"], env["PR_NUMBER"]
+    state = env.get("REVIEW_STATE", "").lower()
+    first = (env.get("REVIEW_BODY", "").split() or [""])[0].lower()
+    if state == "approved" or (state == "commented" and first == "/approve"):
+        outcome = "approved"
+    elif state == "changes_requested" or (state == "commented" and first == "/reject"):
+        outcome = "rejected"
+    else:
+        print("Review is not an approve/reject decision; nothing to do.")
+        return 0
+
+    who = env.get("REVIEWER", "a reviewer")
+    if env.get("REVIEWER_ASSOCIATION") not in ("OWNER", "MEMBER", "COLLABORATOR"):
+        print(f"{who} has no write access; ignoring their review.")
+        return 0
+
+    sticky = find_sticky(repo, pr)
+    if not sticky or PENDING_HEADING not in sticky["body"]:
+        print("No findings are waiting for a decision on this PR; nothing to do.")
+        return 0
+    if f"scanned `{env['PR_HEAD_SHA'][:7]}`" not in sticky["body"]:
+        gh_api("--method", "POST", f"repos/{repo}/issues/{pr}/comments", "-f",
+               body=f"@{who} the findings above are for an older commit. Wait for the rescan of "
+                    f"`{env['PR_HEAD_SHA'][:7]}` and review again.")
+        return 0
+    if sh(["gh", "pr", "view", pr, "--repo", repo, "--json", "state", "-q", ".state"]).stdout.strip() != "OPEN":
+        print("PR is not open; nothing to do.")
+        return 0
+
+    approved = outcome == "approved"
+    verdict = "Approved" if approved else "Rejected"
+    sticky_body = sticky["body"].replace(
+        PENDING_HEADING, f"### {'✅' if approved else '❌'} {verdict} by @{who}"
+    )
+    gh_api("--method", "PATCH", f"repos/{repo}/issues/comments/{sticky['id']}", "-f", f"body={sticky_body}")
     msg = (
-        f"## ✅ Approved by {who}\n\nSecurity findings accepted — merging this PR.{note}"
+        f"## ✅ Approved by @{who}\n\nSecurity findings accepted — merging this PR."
         if approved
-        else f"## ❌ Rejected by {who}\n\nSecurity findings not accepted — closing this PR without merging.{note}"
+        else f"## ❌ Rejected by @{who}\n\nSecurity findings not accepted — closing this PR without merging."
     )
     gh_api("--method", "POST", f"repos/{repo}/issues/{pr}/comments", "-f", f"body={msg}")
-    if approved:
-        sh(["gh", "pr", "merge", pr, "--repo", repo, "--merge"])
-    else:
-        sh(["gh", "pr", "close", pr, "--repo", repo])
+    sh(["gh", "pr", "merge" if approved else "close", pr, "--repo", repo] + (["--merge"] if approved else []))
     return 0
 
 
@@ -229,12 +238,10 @@ def main():
     r.add_argument("input")
     r.add_argument("--min-severity", default=os.environ.get("MIN_SEVERITY", "WARNING"),
                    choices=list(SEVERITY_RANK))
-    r.add_argument("--environment", default="security-approval")
     r.add_argument("--no-comment", dest="comment", action="store_false")
     r.add_argument("--dry-run", action="store_true")
     r.set_defaults(func=cmd_report)
     d = sub.add_parser("decide")
-    d.add_argument("outcome", choices=["approved", "rejected"])
     d.set_defaults(func=cmd_decide)
     args = p.parse_args()
     sys.exit(args.func(args))

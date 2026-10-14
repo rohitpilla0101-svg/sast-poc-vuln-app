@@ -1,0 +1,155 @@
+# Semgrep PR gate with manual approval.
+#
+# Flow: PR opened/updated -> Semgrep scans it -> findings are posted on the PR
+# and the scan check fails -> a designated reviewer approves (PR is merged) or
+# rejects (PR is closed) from the Actions run page.
+#
+# Deliberately no LLM and no auto-fix: nothing here writes code or creates
+# branches. Runs on a self-hosted runner (label `sast-gate`) with python, git
+# and gh on PATH. The previous LLM autofix PoC is archived under
+# poc-archive/llm-autofix/.
+#
+# One-time setup: scripts/setup-approval-environment.sh (creates the
+# `security-approval` environment with required reviewers). See
+# DEMO-APPROVAL-GATE.md.
+name: Semgrep Approval Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the PR supersedes a scan/approval still pending on the old commit.
+  group: semgrep-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash   # the runner is Windows; the steps below are POSIX shell
+
+env:
+  PYTHONUTF8: "1"   # Windows consoles default to cp1252; Semgrep output has non-ASCII
+  APPROVAL_ENVIRONMENT: security-approval
+  # Findings below this severity are reported by Semgrep but do not gate the PR.
+  MIN_SEVERITY: WARNING
+
+jobs:
+  scan:
+    name: Semgrep scan
+    runs-on: [self-hosted, sast-gate]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write   # sticky findings comment
+      actions: read          # verify the approval environment has reviewers
+    outputs:
+      findings: ${{ steps.report.outputs.findings }}
+      approval_ready: ${{ steps.report.outputs.approval_ready }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Scan exactly the PR's code so reported lines match the PR diff.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Install Semgrep
+        run: python -m pip install --quiet semgrep
+
+      - name: Run Semgrep (only findings new in this PR)
+        run: |
+          semgrep scan \
+            --config p/python --config p/flask --config p/security-audit \
+            --baseline-commit "${{ github.event.pull_request.base.sha }}" \
+            --metrics=off --quiet \
+            --json --output semgrep.json
+
+      - name: Report findings on the PR
+        id: report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Fork PRs get a read-only token: skip the comment, keep the summary.
+          POST_COMMENT: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          flags=""
+          if [ "$POST_COMMENT" != "true" ]; then flags="--no-comment"; fi
+          python .github/scripts/semgrep_gate.py report semgrep.json \
+            --environment "$APPROVAL_ENVIRONMENT" $flags
+
+      - name: Fail the check when there are findings
+        if: steps.report.outputs.findings != '0'
+        run: |
+          echo "::error::Semgrep reported ${{ steps.report.outputs.findings }} finding(s). See the PR comment."
+          exit 1
+
+  approval:
+    name: Security approval
+    needs: scan
+    # Only when the scan failed because of findings AND the environment really
+    # has reviewers (otherwise GitHub would let this job through unattended).
+    if: always() && needs.scan.outputs.findings != '' && needs.scan.outputs.findings != '0' && needs.scan.outputs.approval_ready == 'true'
+    runs-on: [self-hosted, sast-gate]
+    environment: security-approval   # required reviewers pause the job here
+    steps:
+      - run: echo "A reviewer approved the Semgrep findings."
+
+  gate:
+    name: Security gate
+    # The one check to require in branch protection: green when the scan is
+    # clean or a reviewer approved; red while pending, when rejected, or when
+    # approval could not be requested.
+    needs: [scan, approval]
+    if: always()
+    runs-on: [self-hosted, sast-gate]
+    steps:
+      - name: Evaluate
+        run: |
+          scan="${{ needs.scan.result }}"; approval="${{ needs.approval.result }}"
+          echo "scan=$scan approval=$approval"
+          if [ "$scan" = "success" ]; then echo "Clean scan."; exit 0; fi
+          if [ "$scan" = "failure" ] && [ "$approval" = "success" ]; then echo "Findings approved."; exit 0; fi
+          echo "::error::Not approved (scan=$scan, approval=$approval)."; exit 1
+
+  merge:
+    name: Merge PR (approved)
+    needs: [approval, gate]
+    if: needs.approval.result == 'success' && needs.gate.result == 'success'
+    runs-on: [self-hosted, sast-gate]
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read          # who approved (run approval history)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Comment and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python .github/scripts/semgrep_gate.py decide approved
+
+  reject:
+    name: Close PR (rejected)
+    needs: approval
+    # A rejected deployment fails the approval job. Cancellation (superseded
+    # by a newer push) is a different result and must not close the PR.
+    if: always() && needs.approval.result == 'failure'
+    runs-on: [self-hosted, sast-gate]
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python .github/scripts/semgrep_gate.py decide rejected
