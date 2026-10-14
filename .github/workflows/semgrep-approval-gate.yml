@@ -23,7 +23,10 @@ concurrency:
 
 defaults:
   run:
-    shell: bash   # the runner is Windows; the steps below are POSIX shell
+    # The runner is Windows and the steps are POSIX shell. Plain `bash` would
+    # resolve to WSL's bash.exe, which cannot run Windows paths: use Git Bash
+    # via its 8.3 path (the shell template cannot hold spaces).
+    shell: C:\PROGRA~1\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}
 
 env:
   PYTHONUTF8: "1"   # Windows consoles default to cp1252; Semgrep output has non-ASCII
