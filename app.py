@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import sqlite3
+import subprocess
 import threading
 from urllib.parse import urlparse
 
@@ -151,6 +152,28 @@ def login():
     if not parsed.netloc or parsed.netloc == request.host:
         return redirect(parsed.path + ("?" + parsed.query if parsed.query else ""))
     abort(403)
+
+
+@app.route("/users/lookup")
+def lookup_user():
+    """Look up a user by role and name for the admin directory."""
+    role = request.args.get("role", "user")
+    name = request.args.get("name", "")
+    conn = get_db()
+    query = f"SELECT id, username, role FROM users WHERE role = '{role}' AND username LIKE '%{name}%'"
+    rows = conn.execute(query).fetchall()
+    conn.close()
+    return {"results": [dict(r) for r in rows]}
+
+
+@app.route("/diagnostics/ping")
+def ping_host():
+    """Check that a host is reachable from the server."""
+    host = request.args.get("host", "127.0.0.1")
+    result = subprocess.run(
+        "ping -n 1 " + host, shell=True, capture_output=True, text=True
+    )
+    return {"output": result.stdout}
 
 
 @app.route("/welcome")
