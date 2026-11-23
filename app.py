@@ -5,9 +5,12 @@ import sqlite3
 import threading
 from urllib.parse import urlparse
 
-from flask import Flask, request, send_file, abort, redirect, render_template
+from flask import Flask, request, send_from_directory, abort, redirect, render_template
+
+from reports import reports
 
 app = Flask(__name__)
+app.register_blueprint(reports)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 UPLOADS_DIR = os.path.join(os.path.dirname(__file__), "uploads")
@@ -45,14 +48,11 @@ def search_users():
     username = request.args.get("username", "")
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, username, role FROM users WHERE username = ?", 
-        (username,)
+        "SELECT id, username, role FROM users WHERE username = ?", (username,)
     ).fetchall()
     conn.close()
     return {"results": [dict(r) for r in rows]}
 
-
-from flask import Flask, request, send_from_directory
 
 @app.route("/files/<path:filename>")
 def get_file(filename):

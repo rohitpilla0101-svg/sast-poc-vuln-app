@@ -1,0 +1,107 @@
+# Active pipeline 2 of 2: dev branch. See the reference notes in examples/pipelines/README.md on demo7.
+#
+# PIPELINE 2 of 2 - DEV branch: STRICT gate before main.
+#
+# dev collects the merged feature work, including any findings pipeline 1
+# tolerated. This pipeline scans dev, fixes what is left on dev-fix and opens
+# a PR into dev. The check on dev passes only when NOTHING confirmed remains:
+# all findings closed, remediated and validated.
+#
+# The rules come from the dashboard policy stage matching dev (Policies page).
+# Make "SAST gate (dev)" a required check on branch protection for main.
+name: SAST Autofix - dev (strict)
+
+on:
+  push:
+    branches:
+      - dev
+      - dev-fix           # runs in check-only mode
+  workflow_dispatch:
+
+permissions:
+  contents: write        # push the <branch>-fix branch
+  pull-requests: write   # open the PR and its inline line comments
+  statuses: write        # post the fix-branch rescan result
+
+concurrency:
+  group: sast-autofix-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  autofix:
+    name: SAST gate (dev)
+    # GitHub Environment "dev": holds this stage's variables and rules.
+    environment: dev
+    runs-on: [self-hosted, sast-autofix]
+    timeout-minutes: 120
+    env:
+      SAST_AUTOFIX_HOME: ${{ vars.SAST_AUTOFIX_HOME || '/home/rcxdigital/SAST-AUTOFIX-POC/sast-autofix-poc' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Prepare tools and git identity
+        run: |
+          echo "$SAST_AUTOFIX_HOME/venv/bin" >> "$GITHUB_PATH"
+          git config user.name "sast-autofix[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install the repo's own dependencies (for its test suite)
+        run: |
+          if [ -f requirements.txt ]; then
+            python3 -m venv .venv
+            .venv/bin/pip install -q -r requirements.txt pytest
+          fi
+
+      - name: Scan, triage (Laya + LLM), fix, rescan, open PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          # Optional override. Normally empty: the gate rules come from the published
+          # policy in the dashboard (Policies -> Stages), matched on this branch.
+          BLOCK_SEVERITIES: ${{ vars.BLOCK_SEVERITIES }}
+        run: |
+          # Fix branches are only checked, never fixed again (no X-fix-fix).
+          mode=""
+          if [[ "$GITHUB_REF_NAME" == *-fix ]]; then mode="--check-only"; fi
+          # The gate (which severities block, how many may remain) is read from the
+          # dashboard policy for this branch. Fail closed: no policy means strict.
+          # A fix PR's head commit is pushed by the bot, which starts no workflow, so
+          # its required check is posted as a commit status under the gate names.
+          gate=()
+          if [ -n "$BLOCK_SEVERITIES" ]; then gate=(--block-severities "$BLOCK_SEVERITIES"); fi
+          "$SAST_AUTOFIX_HOME/venv/bin/python" "$SAST_AUTOFIX_HOME/cli.py" \
+            --config "$SAST_AUTOFIX_HOME/config.yaml" \
+            run --target-repo "$GITHUB_WORKSPACE" \
+            --base-branch "$GITHUB_REF_NAME" \
+            --report-dir "$RUNNER_TEMP/sast-autofix" \
+            --fail-on-findings \
+            --status-context "SAST gate (dev)" \
+            --status-context "SAST gate (feature)" \
+            "${gate[@]}" \
+            $mode
+
+      - name: Record run in the dashboard
+        # Runs even when the merge gate failed the scan step. Non-fatal: a
+        # dashboard problem must never fail a security scan.
+        if: always()
+        continue-on-error: true
+        run: |
+          report="$RUNNER_TEMP/sast-autofix/sast-autofix-report.json"
+          if [ -f "$report" ] && [ -x "$SAST_AUTOFIX_HOME/dashboard/.venv/bin/python" ]; then
+            cd "$SAST_AUTOFIX_HOME" && dashboard/.venv/bin/python -m dashboard.ingest "$report"
+          else
+            echo "No report or no dashboard install; skipping."
+          fi
+
+      - name: Upload run report
+        if: always()
+        # The report is also on the job summary page; a full artifact
+        # storage quota must not turn a successful run red.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sast-autofix-report
+          path: ${{ runner.temp }}/sast-autofix/
+          if-no-files-found: ignore
