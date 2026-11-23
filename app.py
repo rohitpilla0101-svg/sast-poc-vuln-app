@@ -8,9 +8,11 @@ from urllib.parse import urlparse
 from flask import Flask, request, send_from_directory, abort, redirect, render_template
 
 from reports import reports
+from tools import tools
 
 app = Flask(__name__)
 app.register_blueprint(reports)
+app.register_blueprint(tools)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 UPLOADS_DIR = os.path.join(os.path.dirname(__file__), "uploads")
