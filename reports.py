@@ -52,7 +52,7 @@ def search():
 
 
 def cache_key(name: str) -> str:
-    return hashlib.md5(name.encode()).hexdigest()
+    return hashlib.sha256(name.encode()).hexdigest()
 
 
 @reports.route("/<name>/cache-key")
